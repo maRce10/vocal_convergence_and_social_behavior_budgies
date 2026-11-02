@@ -1,0 +1,33 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - index.qmd
+    - scripts/stats_v06_energy.qmd
+
+execute:
+  freeze: auto
+
+website:
+  title: "Vocal convergence and social behavior in budgerigars"
+  site-url: https://marce10.github.io/vocal-convergence-social-behavior-budgies/
+  repo-url: https://github.com/maRce10/vocal-convergence-social-behavior-budgies
+  page-navigation: true
+  navbar:
+    background: "#ffffff"
+    foreground: "#408AB4"
+    left:
+      - href: index.qmd
+        text: Home
+      - href: scripts/stats_v06_energy.qmd
+        text: Statistical analysis
+    right:
+      - icon: github
+        href: https://github.com/maRce10/vocal-convergence-social-behavior-budgies
+        aria-label: GitHub repository
+
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    include-after-body: _figure-download.html

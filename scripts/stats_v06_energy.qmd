@@ -1,0 +1,941 @@
+---
+title: Distangling the effects of social interactions and acoustic convergence
+subtitle: "Vocal convergence and social behavior in budgies (energy distance, aligned blocks)"
+author: <a href="https://marce10.github.io/">Marcelo Araya-Salas</a>
+date: "`r Sys.Date()`"
+toc: true
+toc-depth: 3
+toc-location: left
+number-sections: true
+highlight-style: pygments
+format:
+  html:
+    df-print: kable
+    code-fold: true
+    code-tools: true
+    css: qmd.css
+editor_options:
+  chunk_output_type: console
+---
+
+```{r set root directory}
+#| eval: true
+#| echo: false
+
+# install knitr package if not installed
+if (!requireNamespace("knitr", quietly = TRUE)) {
+  install.packages("knitr")
+}
+
+# set working directory
+knitr::opts_knit$set(root.dir =  "..")
+
+```
+
+```{r add link to github repo}
+#| eval: true
+#| output: asis
+#| echo: false
+
+# print link to github repo if any
+if (file.exists("./.git/config")){
+  config <- readLines("./.git/config")
+  url <- grep("url",  config, value = TRUE)
+  url <- gsub("\\turl = |.git$", "", url)
+  if (length(url) > 0)
+  if (nchar(url) > 1)
+  cat("\nSource code and data found at [", url, "](", url, ")", sep = "")
+  }
+
+```
+
+```{r setup style}
+#| message: false
+#| warning: false
+
+# options to customize chunk outputs
+knitr::opts_chunk$set(
+  tidy = TRUE, # soft-wrap code in output
+  tidy.opts = list(width.cutoff = 65) # width cutoff for soft-wrapping code
+ )
+
+```
+
+<!-- skyblue box -->
+
+::: {.alert .alert-info}
+# Purpose {.unnumbered .unlisted}
+
+- Test whether social interactions (proximity, affiliative and agonistic interactions) and acoustic convergence (energy distance between the calls of two birds) influence each other over time
+- Changes from `stats_v05_energy.qmd`, aimed at correctness and statistical power:
+    1. **Block alignment**: social block *k* was recorded during acoustic block *k + 1* in every group, so social data are now matched to the acoustic block recorded at the same time (previous versions matched equal block numbers, pairing acoustic data with social data from one block later)
+    2. **Acoustic block 1 as baseline**: recorded before the first social observation, it now provides the starting acoustic similarity for the first social period
+    3. **Likelihoods matching the data**: proximity modeled as the number of scans in which the two birds were < 10 cm apart out of the valid scans (beta-binomial), and interaction counts as negative binomial, instead of z-scored Gaussian responses
+    4. **Measurement error in acoustic distance**: bootstrap standard errors of each energy distance enter the models when acoustic dissimilarity is the response (`se()`), so dyads with few calls weigh less. When it is a (lagged) predictor its error is not modeled: `me()` slowed sampling about 25-fold, and ignoring predictor error can only attenuate its slope toward zero, so those estimates are conservative
+    5. **Joint cross-lagged model**: acoustic and social responses modeled together, each on the previous block's values of the others
+    6. **Inference based on effect posteriors** (pd, 95% CI); LOO comparisons are reported per response as a secondary check
+    7. **Treatment (Young / Old)** included as a covariate in all models
+:::
+
+# Load packages {.unnumbered .unlisted}
+
+```{r load packages}
+
+# sketchy is used to install/load the packages below
+if (!requireNamespace("sketchy", quietly = TRUE)) {
+  install.packages("sketchy")
+}
+
+packages <- c(
+  "ggplot2",
+  "viridis",
+  "pbapply",
+  "brms",
+  "ggcorrplot",
+  "brmsish",
+  "proxy",
+  "posterior",
+  "bayestestR",
+  "extraDistr" # needed by brms for beta-binomial log-likelihoods (LOO)
+)
+
+# install/ load packages
+sketchy::load_packages(packages = packages)
+
+```
+
+# Data preparation
+
+## Acoustic distances with measurement error
+
+- Use the PCA on MFCC descriptors from `choosing_vocal_convergence_metric.qmd` (PCs explaining 90% of variance), keeping individual/blocks with at least 10 calls. Unlike previous versions, **acoustic block 1 is kept** as the baseline, and the minimum is lowered from 25 to **10 calls**: the bootstrap SE below down-weights imprecise distances, so birds with 10 to 24 calls can contribute instead of being discarded (below 10 calls the energy distance itself becomes unreliable)
+- For each pair of birds from the same group recorded in the same block, compute the **energy distance** $2E\|X - Y\| - E\|X - X'\| - E\|Y - Y'\|$ from call-to-call Euclidean distances in PC space: the mean distance between the calls of the two birds minus each bird's own within-bird call variability (within-bird terms exclude self-pairs, U-statistic). It is 0 only when both birds' call distributions are identical
+- Its precision depends on how many calls each bird has (10 to > 1,000), so a **bootstrap standard error** is estimated by resampling each bird's calls (100 replicates)
+
+```{r compute energy distances and bootstrap SE}
+
+dist_file <- "./data/processed/energy_distances_bootstrap_min10calls.RDS"
+
+if (!file.exists(dist_file)) {
+
+  set.seed(123)
+  n_boot <- 100
+
+  pca_dat <- readRDS("./data/processed/pca_dat.RDS")
+  pcs <- grep("^PC", names(pca_dat), value = TRUE)
+
+  pca_dat$id_block <- paste(pca_dat$ID, pca_dat$record.block, sep = "_")
+
+  # keep individual/blocks with at least 10 calls (all blocks, including block 1)
+  call_counts <- table(pca_dat$id_block)
+  pca_dat <- pca_dat[pca_dat$id_block %in% names(call_counts)[call_counts >= 10], ]
+
+  # energy distance from a call-to-call distance matrix, given the row indices of each bird
+  # (within-bird terms exclude self-pairs: U-statistic)
+  energy_from_D <- function(D, ia, ib) {
+    2 * mean(D[ia, ib]) -
+      sum(D[ia, ia]) / (length(ia) * (length(ia) - 1)) -
+      sum(D[ib, ib]) / (length(ib) * (length(ib) - 1))
+  }
+
+  grp_blk <- unique(pca_dat[, c("record.group", "record.block")])
+
+  out <- pblapply(seq_len(nrow(grp_blk)), function(i) {
+    Y <- pca_dat[pca_dat$record.group == grp_blk$record.group[i] &
+                   pca_dat$record.block == grp_blk$record.block[i], ]
+
+    ids <- sort(unique(Y$ID))
+    if (length(ids) < 2) return(NULL)
+
+    # all call-to-call distances in this group/block
+    D <- as.matrix(dist(as.matrix(Y[, pcs])))
+    rows <- lapply(ids, function(id) which(Y$ID == id))
+    names(rows) <- ids
+
+    pairs <- t(combn(ids, 2))
+
+    do.call(rbind, lapply(seq_len(nrow(pairs)), function(j) {
+      ia <- rows[[pairs[j, 1]]]
+      ib <- rows[[pairs[j, 2]]]
+
+      boot <- replicate(n_boot, energy_from_D(D, sample(ia, replace = TRUE), sample(ib, replace = TRUE)))
+
+      data.frame(
+        indiv.1 = pairs[j, 1],
+        indiv.2 = pairs[j, 2],
+        time = grp_blk$record.block[i],
+        n.calls.1 = length(ia),
+        n.calls.2 = length(ib),
+        energy = energy_from_D(D, ia, ib),
+        energy_se = sd(boot)
+      )
+    }))
+  })
+
+  energy_dists <- do.call(rbind, out)
+  rownames(energy_dists) <- NULL
+
+  saveRDS(energy_dists, dist_file)
+}
+
+energy_dists <- readRDS(dist_file)
+
+# dyads per acoustic block
+table(time = energy_dists$time)
+
+```
+
+```{r plot energy distance precision}
+#| fig-width: 6
+#| fig-height: 4
+
+energy_dists$min_calls <- pmin(energy_dists$n.calls.1, energy_dists$n.calls.2)
+
+ggplot(energy_dists, aes(x = min_calls, y = energy_se)) +
+  geom_point(color = mako(10)[5], alpha = 0.7) +
+  scale_x_log10() +
+  labs(x = "Calls of the bird with fewer calls (log scale)", y = "Bootstrap SE of energy distance") +
+  theme_classic()
+
+```
+
+## Social data aligned to acoustic blocks
+
+- Social blocks were recorded during the following acoustic block in all 12 groups (midpoint dates within 0.1 to 2.4 days): **social block *k* corresponds to acoustic block *k + 1***. A common time index `time` (= acoustic block, 1 to 5) is used, with social data available for times 2 to 5
+- The block alignment is checked below from the recording dates of the proximity videos and the acoustic recordings. The affiliative and agonistic edge lists have no dates and are assumed to follow the same block numbering as the proximity data
+- Proximity: number of scans in which the two birds were < 10 cm apart (`n_close`) out of the scans in which both birds were visible (`n_valid`)
+- Affiliative and agonistic interactions: number of interactions in either direction per dyad and block (0 when the dyad does not appear in that block's edge list)
+
+```{r check block alignment}
+
+invisible(Sys.setlocale("LC_TIME", "C"))
+
+prox_raw <- read.csv("./data/raw/Proximity_Raw_Data_R.csv")
+prox_raw$date <- as.Date(prox_raw$Video_date, "%d-%b-%y")
+
+sel_meta <- read.csv("./data/raw/sp_selections_analysis_metadata.csv")
+sel_meta$date <- as.Date(sel_meta$date.format)
+
+alignment <- do.call(rbind, lapply(sort(unique(prox_raw$Group)), function(g) {
+  soc_mid <- tapply(prox_raw$date[prox_raw$Group == g], prox_raw$block[prox_raw$Group == g], mean)
+  ac_mid <- tapply(sel_meta$date[sel_meta$record.group == g], sel_meta$record.block[sel_meta$record.group == g], mean)
+  data.frame(
+    group = g,
+    social_block = as.numeric(names(soc_mid)),
+    acoustic_block_same_dates = as.numeric(sapply(soc_mid, function(s) names(ac_mid)[which.min(abs(ac_mid - s))])),
+    days_apart = sapply(soc_mid, function(s) round(min(abs(ac_mid - s)), 1))
+  )
+}))
+
+table(social_block = alignment$social_block, acoustic_block = alignment$acoustic_block_same_dates)
+
+range(alignment$days_apart)
+
+stopifnot(all(alignment$acoustic_block_same_dates == alignment$social_block + 1))
+
+```
+
+```{r build social data}
+
+# proximity: close and valid scans per dyad and social block
+prox_raw$pair <- paste(prox_raw$Neighbor_1, prox_raw$Neighbor_2, sep = "_")
+
+prox_agg <- do.call(rbind, lapply(split(prox_raw, list(prox_raw$pair, prox_raw$block), drop = TRUE), function(x) {
+  data.frame(
+    pair = x$pair[1],
+    indiv.1 = x$Neighbor_1[1],
+    indiv.2 = x$Neighbor_2[1],
+    group = paste0("g", x$Group[1]),
+    treatment = x$Treatment[1],
+    time = x$block[1] + 1, # social block k = acoustic block k + 1
+    n_close = sum(x$Distance_cm < 10, na.rm = TRUE),
+    n_valid = sum(!is.na(x$Distance_cm))
+  )
+}))
+
+# affiliative and agonistic interactions per dyad and social block
+count_interactions <- function(prefix) {
+  files <- list.files("./data/raw", pattern = paste0("^", prefix, "_g.*_block[0-9]\\.csv$"), full.names = TRUE)
+
+  do.call(rbind, lapply(files, function(x) {
+    Y <- read.csv(x, stringsAsFactors = FALSE)
+    if (nrow(Y) == 0) return(NULL)
+    names(Y)[1:2] <- c("actor", "recipient")
+    block <- as.numeric(gsub("block|\\.csv", "", strsplit(basename(x), "_")[[1]][4]))
+    pairs <- apply(Y[, c("actor", "recipient")], 1, function(z) paste(sort(z), collapse = "_"))
+    tab <- table(pairs)
+    data.frame(pair = names(tab), time = block + 1, n = as.vector(tab))
+  }))
+}
+
+aff_counts <- count_interactions("aff")
+ago_counts <- count_interactions("ago")
+
+social <- prox_agg
+social$affiliative <- 0
+social$agonistic <- 0
+
+key_soc <- paste(social$pair, social$time)
+social$affiliative[match(paste(aff_counts$pair, aff_counts$time), key_soc)] <- aff_counts$n
+social$agonistic[match(paste(ago_counts$pair, ago_counts$time), key_soc)] <- ago_counts$n
+
+# check that all interaction records matched a dyad in the proximity data
+stopifnot(all(paste(aff_counts$pair, aff_counts$time) %in% key_soc),
+          all(paste(ago_counts$pair, ago_counts$time) %in% key_soc))
+
+head(social)
+
+```
+
+## Combined dyad x time dataset
+
+- One row per dyad and time (acoustic block 1 to 5); acoustic data are missing when one of the birds had fewer than 10 calls in that block, and social data are missing at time 1
+- Predictors are standardized: acoustic dissimilarity (energy distance) and its SE are divided by the SD of energy distance, proximity enters as the proportion of close scans and interaction counts as log(count + 1), each z-scored
+- Lagged (previous block) and lead (next block) values are computed within dyad, only when the adjacent block exists
+
+```{r combine dyad by time data}
+
+dyads <- unique(social[, c("pair", "indiv.1", "indiv.2", "group", "treatment")])
+
+dat <- merge(dyads, data.frame(time = 1:5))
+dat <- merge(dat, social[, c("pair", "time", "n_close", "n_valid", "affiliative", "agonistic")],
+             by = c("pair", "time"), all.x = TRUE)
+
+energy_dists$pair <- paste(energy_dists$indiv.1, energy_dists$indiv.2, sep = "_")
+dat <- merge(dat, energy_dists[, c("pair", "time", "energy", "energy_se")], by = c("pair", "time"), all.x = TRUE)
+
+dat <- dat[order(dat$pair, dat$time), ]
+
+# standardize (names without underscores keep brms parameter names simple)
+ac_mean <- mean(dat$energy, na.rm = TRUE)
+ac_sd <- sd(dat$energy, na.rm = TRUE)
+dat$ac <- (dat$energy - ac_mean) / ac_sd
+dat$acse <- dat$energy_se / ac_sd
+
+z <- function(x) as.vector(scale(x))
+dat$prox <- z(dat$n_close / dat$n_valid)
+dat$ago <- z(log1p(dat$agonistic))
+dat$aff <- z(log1p(dat$affiliative))
+dat$treatment <- factor(dat$treatment, levels = c("Old", "Young"))
+
+# previous and next block values within dyad
+shift_by_time <- function(d, vars, k) {
+  for (v in vars) {
+    d[[paste0(v, ifelse(k > 0, "lag", "lead"))]] <- d[[v]][match(d$time - k, d$time)]
+  }
+  d
+}
+
+lag_vars <- c("ac", "acse", "prox", "ago", "aff")
+
+dat <- do.call(rbind, lapply(split(dat, dat$pair), function(d) {
+  d <- shift_by_time(d, lag_vars, 1)
+  shift_by_time(d, c("prox", "ago", "aff"), -1)
+}))
+rownames(dat) <- NULL
+
+write.csv(dat, "./data/processed/dyad_by_time_energy_aligned.csv", row.names = FALSE)
+
+# rows usable by each model
+n_models <- data.frame(
+  model = c("Model 1: social during period -> acoustic change",
+            "Model 2: cross-lagged, acoustic response",
+            "Model 2: cross-lagged, social responses",
+            "Placebo: next period social -> acoustic change",
+            "stats_v05 lagged models (misaligned blocks)"),
+  rows = c(
+    sum(complete.cases(dat[, c("ac", "aclag", "prox", "ago", "aff")])),
+    sum(complete.cases(dat[, c("ac", "aclag", "proxlag", "agolag", "afflag")])),
+    sum(complete.cases(dat[, c("aclag", "prox", "proxlag", "ago", "agolag", "aff", "afflag")])),
+    sum(complete.cases(dat[, c("ac", "aclag", "proxlead", "agolead", "afflead")])),
+    77
+  )
+)
+
+n_models
+
+```
+
+```{r predictor correlations}
+
+corr_mat <- cor(dat[, c("ac", "prox", "ago", "aff")], use = "pairwise.complete.obs")
+
+cols <- mako(10, alpha = 0.8, begin = 0.2, end = 0.75)
+
+ggcorrplot(corr_mat, type = "lower", lab = TRUE, lab_size = 4,
+           colors = c(cols[1], "white", cols[10]),
+           title = "Pairwise correlations (same time)")
+
+```
+
+# Statistical analysis
+
+## Helpers for model summaries
+
+- Small functions used to write the summary boxes after each model, so that the numbers (and whether an effect counts as credible) are always computed from the fitted models in this document
+- An effect is called **credible** when its 95% CI excludes zero, **suggestive** when the probability of direction (pd) is >= 0.95 but the 95% CI still includes zero, and **not supported** otherwise. LOO comparisons treat |elpd_diff| < 4 or |elpd_diff| / SE < 2 as indistinguishable
+
+```{r summary helpers}
+#| code-fold: true
+
+iterations <- 4000
+warmup <- 2000
+
+# convergence diagnostics on population-level and variance parameters
+fit_diag <- function(fit) {
+  np <- nuts_params(fit)
+  drws <- posterior::subset_draws(posterior::as_draws_df(fit),
+                                  variable = "^(b_|sd_|sigma|shape|phi)", regex = TRUE)
+  smry <- posterior::summarise_draws(drws, "rhat", "ess_bulk", "ess_tail")
+  list(
+    ndiv = sum(np$Value[np$Parameter == "divergent__"]),
+    ndraws = posterior::ndraws(fit),
+    rhat = max(smry$rhat, na.rm = TRUE),
+    ess_bulk = min(smry$ess_bulk, na.rm = TRUE),
+    ess_tail = min(smry$ess_tail, na.rm = TRUE),
+    n = nrow(fit$data)
+  )
+}
+
+diag_text <- function(d) {
+  ok_mix <- d$rhat <= 1.01 && min(d$ess_bulk, d$ess_tail) >= 400
+  verdict <- if (d$ndiv == 0 && ok_mix) {
+    "the chains converged to a common posterior and the reported medians and CIs are not limited by sampling noise"
+  } else if (ok_mix && d$ndiv / d$ndraws < 0.005) {
+    "the few divergences (< 0.5% of draws) are unlikely to bias the estimates, although raising `adapt_delta` further would be needed to remove them entirely"
+  } else {
+    "the estimates should be treated with caution until the sampler problems are resolved"
+  }
+  paste0("Across 4 chains x ", iterations, " iterations (", warmup, " warmup; n = ", d$n,
+         " rows) there were ", d$ndiv, " divergent transitions, the largest R-hat is ",
+         sprintf("%.3f", d$rhat), " and the minimum bulk and tail ESS are ", round(d$ess_bulk),
+         " and ", round(d$ess_tail), " (rule of thumb: R-hat <= 1.01 and ESS >= ~400), so ", verdict, ".")
+}
+
+# name of the single parameter matching a pattern (e.g. coefficients of multivariate responses)
+find_par <- function(fit, pattern) {
+  nm <- grep(pattern, posterior::variables(fit), value = TRUE)
+  if (length(nm) != 1) stop("pattern '", pattern, "' matched: ", paste(nm, collapse = ", "))
+  nm
+}
+
+# posterior summary of a single coefficient
+coef_stats <- function(fit, pattern) {
+  x <- posterior::as_draws_df(fit)[[find_par(fit, pattern)]]
+  list(est = median(x), lo = unname(quantile(x, 0.025)), hi = unname(quantile(x, 0.975)),
+       pd = max(mean(x > 0), mean(x < 0)))
+}
+
+fmt_coef <- function(cs) {
+  sprintf("median = %.2f, 95%% CI [%.2f, %.2f], pd = %.3f", cs$est, cs$lo, cs$hi, cs$pd)
+}
+
+support <- function(cs) {
+  if (cs$lo > 0 || cs$hi < 0) "credible" else if (cs$pd >= 0.95) "suggestive" else "not supported"
+}
+
+# sentence describing an effect; 'pos' / 'neg' describe what a positive / negative slope means
+claim <- function(cs, pos, neg) {
+  dir_text <- if (cs$est > 0) pos else neg
+  switch(support(cs),
+    credible = paste0("**Credible**: ", dir_text, " (", fmt_coef(cs), ")."),
+    suggestive = paste0("**Suggestive only** (pd >= 0.95 but the 95% CI includes zero): ", dir_text,
+                        " (", fmt_coef(cs), ")."),
+    paste0("**Not supported**: the 95% CI includes zero and pd < 0.95 (", fmt_coef(cs), "), so the data are consistent with no effect.")
+  )
+}
+
+# LOO comparison of full vs null model
+loo_stats <- function(loo_full, loo_null) {
+  cmp <- loo_compare(loo_null, loo_full)
+  d <- loo_full$estimates["elpd_loo", "Estimate"] - loo_null$estimates["elpd_loo", "Estimate"]
+  se <- as.numeric(cmp[2, "se_diff"])
+  list(diff = d, se = se, ratio = abs(d) / se,
+       nk = sum(loo_full$diagnostics$pareto_k > 0.7),
+       verdict = if (abs(d) < 4 || abs(d) / se < 2) "indistinguishable" else if (d > 0) "better" else "worse")
+}
+
+loo_text <- function(l, what) {
+  paste0("Adding ", what, " changes expected out-of-sample predictive accuracy by elpd = ",
+         sprintf("%.2f", l$diff), " (SE = ", sprintf("%.2f", l$se), "; |diff| / SE = ",
+         sprintf("%.2f", l$ratio), "), so the full model is ",
+         switch(l$verdict,
+                indistinguishable = "**not distinguishable from the null** in predictive terms",
+                better = "**credibly better than the null** in predictive terms",
+                worse = "**credibly worse than the null** in predictive terms"),
+         if (l$nk > 0) paste0(" (", l$nk, " observations with Pareto k > 0.7, so this PSIS-LOO estimate is approximate)") else "",
+         ".")
+}
+
+any_credible <- function(...) any(sapply(list(...), support) == "credible")
+
+```
+
+## Model 1: social behavior during a period and acoustic convergence
+
+- Response: acoustic dissimilarity (energy distance, standardized) at time *t*, with its bootstrap SE (`se()`), so imprecise distances weigh less
+- Predictors: acoustic dissimilarity at *t - 1*, proximity, agonistic and affiliative interactions recorded **during** time *t*, and treatment. Because the previous acoustic dissimilarity is controlled, the social coefficients describe the **change** in acoustic similarity over a period in which the dyad interacted more or less: a negative slope means more interaction goes with more convergence
+- Uses acoustic block 1 as the baseline for the first social period
+- Compared against a null without the social predictors
+
+```{r fit model 1}
+#| output: asis
+
+dat_m1 <- dat[complete.cases(dat[, c("ac", "acse", "aclag", "acselag", "prox", "ago", "aff")]), ]
+
+priors_m1 <- c(
+  prior(normal(0, 1),   class = "Intercept"),
+  prior(normal(0, 0.5), class = "b"),
+  prior(exponential(2), class = "sd"),
+  prior(exponential(1), class = "sigma")
+)
+
+mod_m1 <- brm(
+  ac | se(acse, sigma = TRUE) ~ aclag + prox + ago + aff + treatment +
+    (1 | group) + (1 | mm(indiv.1, indiv.2)),
+  data = dat_m1,
+  family = gaussian(),
+  save_pars = save_pars(all = TRUE),
+  prior = priors_m1,
+  chains = 4, cores = 4, iter = iterations, warmup = warmup,
+  backend = "cmdstanr", threads = threading(8),
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  file = "./data/processed/fits/brms_v06_m1_energy",
+  file_refit = "on_change"
+)
+
+mod_m1_null <- brm(
+  ac | se(acse, sigma = TRUE) ~ aclag + treatment +
+    (1 | group) + (1 | mm(indiv.1, indiv.2)),
+  data = dat_m1,
+  family = gaussian(),
+  save_pars = save_pars(all = TRUE),
+  prior = priors_m1,
+  chains = 4, cores = 4, iter = iterations, warmup = warmup,
+  backend = "cmdstanr", threads = threading(8),
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  file = "./data/processed/fits/brms_v06_m1_null_energy",
+  file_refit = "on_change"
+)
+
+extended_summary(mod_m1)
+
+bayestestR::describe_posterior(mod_m1, test = "pd", ci = 0.95)
+
+```
+
+```{r model 1 loo}
+loo_m1 <- loo(mod_m1)
+loo_m1_null <- loo(mod_m1_null)
+
+loo_compare(loo_m1_null, loo_m1)
+```
+
+### Prior and posterior predictive checks
+
+```{r model 1 predictive checks}
+#| fig-width: 9
+#| fig-height: 4
+
+mod_m1_prior <- update(
+  mod_m1,
+  sample_prior = "only",
+  file = "./data/processed/fits/brms_v06_m1_prioronly_energy",
+  file_refit = "on_change"
+)
+
+pp_check(mod_m1_prior, ndraws = 100) + ggtitle("Prior predictive check: Model 1")
+
+pp_check(mod_m1, ndraws = 100) + ggtitle("Posterior predictive check: Model 1")
+```
+
+```{r model 1 summary values}
+#| echo: false
+d_m1 <- fit_diag(mod_m1)
+c_m1_pers <- coef_stats(mod_m1, "^b_aclag$")
+c_m1_prox <- coef_stats(mod_m1, "^b_prox$")
+c_m1_ago <- coef_stats(mod_m1, "^b_ago$")
+c_m1_aff <- coef_stats(mod_m1, "^b_aff$")
+c_m1_trt <- coef_stats(mod_m1, "^b_treatmentYoung$")
+l_m1 <- loo_stats(loo_m1, loo_m1_null)
+```
+
+::: {.alert .alert-info}
+###### Summary {.unnumbered .unlisted}
+
+#### Model summary
+
+- `r diag_text(d_m1)`
+- `r loo_text(l_m1, "the three social predictors")`
+
+#### Interpretation
+
+- Acoustic dissimilarity persists between consecutive blocks (`r fmt_coef(c_m1_pers)`), so the social effects are effects on the **change** in acoustic similarity.
+- Proximity: `r claim(c_m1_prox, "dyads that spent more time close together during a period became more different acoustically over that period", "dyads that spent more time close together during a period converged acoustically over that period")`
+- Agonistic interactions: `r claim(c_m1_ago, "dyads with more agonistic interactions during a period became more different acoustically over that period", "dyads with more agonistic interactions during a period converged acoustically over that period")`
+- Affiliative interactions: `r claim(c_m1_aff, "dyads with more affiliative interactions during a period became more different acoustically over that period", "dyads with more affiliative interactions during a period converged acoustically over that period")`
+- Treatment (Young vs Old): `r claim(c_m1_trt, "dyads in Young groups became more different acoustically than those in Old groups", "dyads in Young groups converged more than those in Old groups")`
+- `r if (any_credible(c_m1_prox, c_m1_ago, c_m1_aff)) "At least one social behavior during a period is associated with how much the dyad's calls converged over that same period. Because both were measured over the same period, this shows co-occurrence rather than which comes first; Model 2 tests the time order." else "None of the social behaviors during a period is associated with how much the dyad's calls converged over that same period."`
+:::
+
+## Model 2: cross-lagged joint model
+
+- Four responses fitted jointly at time *t* (times 3 to 5), each predicted by its own value at *t - 1* (persistence) plus the cross-lagged terms:
+    - **Acoustic dissimilarity** (with SE) ~ acoustic dissimilarity at *t - 1* + proximity, agonistic and affiliative interactions at *t - 1* (social -> acoustic)
+    - **Close scans** out of valid scans (beta-binomial) ~ proximity at *t - 1* + acoustic dissimilarity at *t - 1* (acoustic -> social)
+    - **Agonistic** and **affiliative** counts (negative binomial) ~ own value at *t - 1* + acoustic dissimilarity at *t - 1* (acoustic -> social)
+- All responses include treatment and group and dyad (multi-membership) random intercepts; lagged acoustic dissimilarity enters as a plain predictor (its measurement error would only attenuate its slope)
+- The acoustic response is missing for some rows (birds with < 10 calls), handled with `subset()` so that the social responses still use those rows
+- Compared against a null without the cross-lagged terms (persistence and treatment only), response by response with LOO
+
+```{r fit model 2}
+#| output: asis
+
+dat_m2 <- dat[complete.cases(dat[, c("aclag", "acselag", "proxlag", "agolag", "afflag",
+                                     "n_close", "n_valid", "agonistic", "affiliative")]), ]
+
+# acoustic response missing for some rows: placeholder values excluded through subset()
+dat_m2$sub_ac <- !is.na(dat_m2$ac)
+dat_m2$ac[!dat_m2$sub_ac] <- 0
+dat_m2$acse[!dat_m2$sub_ac] <- 1
+
+re <- "(1 | group) + (1 | mm(indiv.1, indiv.2))"
+
+bf_ac <- bf(as.formula(paste("ac | se(acse, sigma = TRUE) + subset(sub_ac) ~ aclag + proxlag + agolag + afflag + treatment +", re)), family = gaussian())
+bf_close <- bf(as.formula(paste("n_close | trials(n_valid) ~ proxlag + aclag + treatment +", re)), family = beta_binomial())
+bf_ago <- bf(as.formula(paste("agonistic ~ agolag + aclag + treatment +", re)), family = negbinomial())
+bf_aff <- bf(as.formula(paste("affiliative ~ afflag + aclag + treatment +", re)), family = negbinomial())
+
+bf_ac_null <- bf(as.formula(paste("ac | se(acse, sigma = TRUE) + subset(sub_ac) ~ aclag + treatment +", re)), family = gaussian())
+bf_close_null <- bf(as.formula(paste("n_close | trials(n_valid) ~ proxlag + treatment +", re)), family = beta_binomial())
+bf_ago_null <- bf(as.formula(paste("agonistic ~ agolag + treatment +", re)), family = negbinomial())
+bf_aff_null <- bf(as.formula(paste("affiliative ~ afflag + treatment +", re)), family = negbinomial())
+
+priors_resp <- function(resp, b = TRUE, intercept_sd = 2.5) {
+  p <- c(
+    set_prior(paste0("normal(0, ", intercept_sd, ")"), class = "Intercept", resp = resp),
+    set_prior("exponential(2)", class = "sd", resp = resp)
+  )
+  if (b) p <- c(p, set_prior("normal(0, 0.5)", class = "b", resp = resp))
+  p
+}
+
+priors_m2 <- c(
+  priors_resp("ac", intercept_sd = 1),
+  set_prior("exponential(1)", class = "sigma", resp = "ac"),
+  priors_resp("nclose"),
+  priors_resp("agonistic"),
+  priors_resp("affiliative")
+)
+
+mod_m2 <- brm(
+  bf_ac + bf_close + bf_ago + bf_aff + set_rescor(FALSE),
+  data = dat_m2,
+  save_pars = save_pars(all = TRUE),
+  prior = priors_m2,
+  chains = 4, cores = 4, iter = iterations, warmup = warmup,
+  backend = "cmdstanr", threads = threading(8),
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  file = "./data/processed/fits/brms_v06_m2_energy",
+  file_refit = "on_change"
+)
+
+mod_m2_null <- brm(
+  bf_ac_null + bf_close_null + bf_ago_null + bf_aff_null + set_rescor(FALSE),
+  data = dat_m2,
+  save_pars = save_pars(all = TRUE),
+  prior = priors_m2,
+  chains = 4, cores = 4, iter = iterations, warmup = warmup,
+  backend = "cmdstanr", threads = threading(8),
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  file = "./data/processed/fits/brms_v06_m2_null_energy",
+  file_refit = "on_change"
+)
+
+extended_summary(mod_m2)
+
+bayestestR::describe_posterior(mod_m2, test = "pd", ci = 0.95)
+
+```
+
+```{r model 2 loo by response}
+resps <- c("ac", "nclose", "agonistic", "affiliative")
+
+loo_m2 <- lapply(resps, function(r) loo(mod_m2, resp = r))
+loo_m2_null <- lapply(resps, function(r) loo(mod_m2_null, resp = r))
+names(loo_m2) <- names(loo_m2_null) <- resps
+
+for (r in resps) {
+  cat("\n---", r, "---\n")
+  print(loo_compare(loo_m2_null[[r]], loo_m2[[r]]))
+}
+```
+
+### Posterior predictive checks
+
+```{r model 2 predictive checks}
+#| fig-width: 9
+#| fig-height: 4
+
+# prior-only sampling of this model is not practical: with weakly informative priors on the
+# log / logit scale the negative binomial and beta-binomial responses produce extreme counts
+# that the sampler cannot explore, so only posterior predictive checks are shown here
+for (r in resps) {
+  print(pp_check(mod_m2, resp = r, ndraws = 100) + ggtitle(paste("Posterior predictive check:", r)))
+}
+```
+
+```{r model 2 summary values}
+#| echo: false
+d_m2 <- fit_diag(mod_m2)
+
+c_m2_ac_pers <- coef_stats(mod_m2, "^b_ac_aclag$")
+c_m2_ac_prox <- coef_stats(mod_m2, "^b_ac_proxlag$")
+c_m2_ac_ago <- coef_stats(mod_m2, "^b_ac_agolag$")
+c_m2_ac_aff <- coef_stats(mod_m2, "^b_ac_afflag$")
+
+c_m2_close <- coef_stats(mod_m2, "^b_nclose_aclag$")
+c_m2_ago <- coef_stats(mod_m2, "^b_agonistic_aclag$")
+c_m2_aff <- coef_stats(mod_m2, "^b_affiliative_aclag$")
+
+c_m2_close_pers <- coef_stats(mod_m2, "^b_nclose_proxlag$")
+c_m2_ago_pers <- coef_stats(mod_m2, "^b_agonistic_agolag$")
+c_m2_aff_pers <- coef_stats(mod_m2, "^b_affiliative_afflag$")
+
+l_m2 <- lapply(resps, function(r) loo_stats(loo_m2[[r]], loo_m2_null[[r]]))
+names(l_m2) <- resps
+```
+
+::: {.alert .alert-info}
+###### Summary {.unnumbered .unlisted}
+
+#### Model summary
+
+- `r diag_text(d_m2)`
+- Acoustic response: `r loo_text(l_m2$ac, "the three lagged social predictors")`
+- Proximity response: `r loo_text(l_m2$nclose, "lagged acoustic dissimilarity")`
+- Agonistic response: `r loo_text(l_m2$agonistic, "lagged acoustic dissimilarity")`
+- Affiliative response: `r loo_text(l_m2$affiliative, "lagged acoustic dissimilarity")`
+
+#### Interpretation
+
+- Persistence from one block to the next: acoustic dissimilarity `r fmt_coef(c_m2_ac_pers)`; proximity (logit scale) `r fmt_coef(c_m2_close_pers)`; agonistic (log scale) `r fmt_coef(c_m2_ago_pers)`; affiliative (log scale) `r fmt_coef(c_m2_aff_pers)`.
+- **Social -> acoustic** (previous block's behavior on the change in acoustic similarity):
+    - Proximity: `r claim(c_m2_ac_prox, "more time close together in one block was followed by acoustic divergence in the next", "more time close together in one block was followed by acoustic convergence in the next")`
+    - Agonistic: `r claim(c_m2_ac_ago, "more agonistic interactions in one block were followed by acoustic divergence in the next", "more agonistic interactions in one block were followed by acoustic convergence in the next")`
+    - Affiliative: `r claim(c_m2_ac_aff, "more affiliative interactions in one block were followed by acoustic divergence in the next", "more affiliative interactions in one block were followed by acoustic convergence in the next")`
+- **Acoustic -> social** (previous block's acoustic dissimilarity on behavior, link scale):
+    - Proximity: `r claim(c_m2_close, "dyads that sounded more different spent more time close together in the next block", "dyads that sounded more alike spent more time close together in the next block")`
+    - Agonistic: `r claim(c_m2_ago, "dyads that sounded more different had more agonistic interactions in the next block", "dyads that sounded more alike had more agonistic interactions in the next block")`
+    - Affiliative: `r claim(c_m2_aff, "dyads that sounded more different had more affiliative interactions in the next block", "dyads that sounded more alike had more affiliative interactions in the next block")`
+- `r if (any_credible(c_m2_ac_prox, c_m2_ac_ago, c_m2_ac_aff, c_m2_close, c_m2_ago, c_m2_aff)) "At least one cross-lagged effect is credible, so the time order of acoustic and social changes is informative for that pair of variables; see the robustness checks below before treating it as directional." else "No cross-lagged effect is credible: with blocks a few days apart, neither social behavior predicts later acoustic change nor acoustic similarity predicts later social behavior, beyond each variable's own persistence."`
+:::
+
+## Robustness checks
+
+### Placebo: next period's social behavior
+
+- Same as Model 1 but with social behavior from the **next** period (*t + 1*), which cannot cause the acoustic change from *t - 1* to *t*. Credible effects here would point to stable dyad-level confounding not absorbed by the random effects
+
+```{r fit placebo model}
+#| output: asis
+
+dat_pl <- dat[complete.cases(dat[, c("ac", "acse", "aclag", "acselag", "proxlead", "agolead", "afflead")]), ]
+
+mod_placebo <- brm(
+  ac | se(acse, sigma = TRUE) ~ aclag + proxlead + agolead + afflead + treatment +
+    (1 | group) + (1 | mm(indiv.1, indiv.2)),
+  data = dat_pl,
+  family = gaussian(),
+  save_pars = save_pars(all = TRUE),
+  prior = priors_m1,
+  chains = 4, cores = 4, iter = iterations, warmup = warmup,
+  backend = "cmdstanr", threads = threading(8),
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  file = "./data/processed/fits/brms_v06_placebo_energy",
+  file_refit = "on_change"
+)
+
+bayestestR::describe_posterior(mod_placebo, test = "pd", ci = 0.95)
+```
+
+```{r placebo summary values}
+#| echo: false
+d_pl <- fit_diag(mod_placebo)
+c_pl_prox <- coef_stats(mod_placebo, "^b_proxlead$")
+c_pl_ago <- coef_stats(mod_placebo, "^b_agolead$")
+c_pl_aff <- coef_stats(mod_placebo, "^b_afflead$")
+pl_flag <- any(sapply(list(c_pl_prox, c_pl_ago, c_pl_aff), support) != "not supported")
+```
+
+::: {.alert .alert-info}
+###### Summary {.unnumbered .unlisted}
+
+#### Model summary
+
+- `r diag_text(d_pl)`
+
+#### Interpretation
+
+- Next period's proximity: `r fmt_coef(c_pl_prox)` (`r support(c_pl_prox)`); agonistic: `r fmt_coef(c_pl_ago)` (`r support(c_pl_ago)`); affiliative: `r fmt_coef(c_pl_aff)` (`r support(c_pl_aff)`).
+- `r if (!pl_flag) "**Placebo passed**: future behavior does not 'predict' past acoustic change, so the effects in Models 1 and 2 are unlikely to be artifacts of stable dyad-level tendencies." else "**Placebo not clean**: at least one future social variable 'predicts' past acoustic change at pd >= 0.95, which cannot be causal. This points to a stable dyad-level tendency not fully absorbed by the random effects, and effects of that variable in Models 1 and 2 should be interpreted with corresponding caution."`
+:::
+
+### Prior sensitivity
+
+- Refits Models 1 and 2 with the slope prior SD doubled (`normal(0, 1)` instead of `normal(0, 0.5)`); key effects should barely move if they are driven by the data
+
+```{r prior sensitivity}
+#| output: asis
+
+priors_m1_wide <- priors_m1
+priors_m1_wide$prior[priors_m1_wide$class == "b"] <- "normal(0, 1)"
+
+mod_m1_wide <- update(
+  mod_m1,
+  prior = priors_m1_wide,
+  file = "./data/processed/fits/brms_v06_m1_wide_energy",
+  file_refit = "on_change"
+)
+
+priors_m2_wide <- priors_m2
+priors_m2_wide$prior[priors_m2_wide$class == "b"] <- "normal(0, 1)"
+
+mod_m2_wide <- update(
+  mod_m2,
+  prior = priors_m2_wide,
+  file = "./data/processed/fits/brms_v06_m2_wide_energy",
+  file_refit = "on_change"
+)
+
+# key effects under both priors
+key_effects <- data.frame(
+  model = c(rep("Model 1", 3), rep("Model 2", 6)),
+  parameter = c("^b_prox$", "^b_ago$", "^b_aff$",
+                "^b_ac_proxlag$", "^b_ac_agolag$", "^b_ac_afflag$",
+                "^b_nclose_aclag$", "^b_agonistic_aclag$", "^b_affiliative_aclag$")
+)
+
+sens <- do.call(rbind, lapply(seq_len(nrow(key_effects)), function(i) {
+  fits <- if (key_effects$model[i] == "Model 1") list(mod_m1, mod_m1_wide) else list(mod_m2, mod_m2_wide)
+  a <- coef_stats(fits[[1]], key_effects$parameter[i])
+  b <- coef_stats(fits[[2]], key_effects$parameter[i])
+  data.frame(model = key_effects$model[i],
+             parameter = find_par(fits[[1]], key_effects$parameter[i]),
+             original = fmt_coef(a), wide_prior = fmt_coef(b),
+             shift = round(b$est - a$est, 3))
+}))
+
+sens
+```
+
+::: {.alert .alert-info}
+###### Summary {.unnumbered .unlisted}
+
+#### Interpretation
+
+- The largest shift in a key effect when the slope prior is doubled is `r sprintf("%.3f", max(abs(sens$shift)))` (on the standardized / link scale), so the results are `r if (max(abs(sens$shift)) < 0.05) "driven by the data rather than by the choice of prior" else "partly sensitive to the prior; the effects that shift most should be reported under both priors"`.
+:::
+
+### Leave-one-dyad-out cross-validation (optional)
+
+- Stricter than PSIS-LOO with small, unbalanced clusters; not run by default given the cost (one refit per dyad). Set `eval: true` to run it for Model 1
+
+```{r leave-one-dyad-out cross-validation}
+#| eval: false
+
+kfold_m1 <- kfold(mod_m1, group = "pair", chains = 1,
+                  file = "./data/processed/fits/brms_v06_m1_kfold_energy")
+kfold_m1_null <- kfold(mod_m1_null, group = "pair", chains = 1,
+                       file = "./data/processed/fits/brms_v06_m1_null_kfold_energy")
+
+loo_compare(kfold_m1_null, kfold_m1)
+```
+
+## Summary of effects
+
+```{r summary of effects}
+effects_tbl <- data.frame(
+  direction = c(rep("Social during period -> acoustic change (Model 1)", 3),
+                rep("Social -> later acoustic change (Model 2)", 3),
+                rep("Acoustic -> later social (Model 2)", 3),
+                rep("Placebo: future social -> acoustic change", 3)),
+  variable = rep(c("proximity", "agonistic", "affiliative"), 4),
+  estimate = sapply(list(c_m1_prox, c_m1_ago, c_m1_aff, c_m2_ac_prox, c_m2_ac_ago, c_m2_ac_aff,
+                         c_m2_close, c_m2_ago, c_m2_aff, c_pl_prox, c_pl_ago, c_pl_aff), fmt_coef),
+  support = sapply(list(c_m1_prox, c_m1_ago, c_m1_aff, c_m2_ac_prox, c_m2_ac_ago, c_m2_ac_aff,
+                        c_m2_close, c_m2_ago, c_m2_aff, c_pl_prox, c_pl_ago, c_pl_aff), support)
+)
+
+write.csv(effects_tbl, "./data/processed/effects_summary_v06_energy.csv", row.names = FALSE)
+
+effects_tbl
+```
+
+```{r plot summary of effects}
+#| fig-width: 8
+#| fig-height: 6
+
+effects_plot <- data.frame(
+  direction = factor(effects_tbl$direction, levels = unique(effects_tbl$direction)),
+  variable = effects_tbl$variable,
+  support = factor(effects_tbl$support, levels = c("credible", "suggestive", "not supported")),
+  t(sapply(list(c_m1_prox, c_m1_ago, c_m1_aff, c_m2_ac_prox, c_m2_ac_ago, c_m2_ac_aff,
+                c_m2_close, c_m2_ago, c_m2_aff, c_pl_prox, c_pl_ago, c_pl_aff),
+           function(cs) c(est = cs$est, lo = cs$lo, hi = cs$hi)))
+)
+
+effects_gg <- ggplot(effects_plot, aes(x = est, y = variable, color = support)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), size = 0.5) +
+  facet_wrap(~ direction, ncol = 1, scales = "free_x") +
+  scale_color_manual(values = c(credible = mako(10)[3], suggestive = mako(10)[6], `not supported` = "gray65"),
+                     drop = FALSE) +
+  labs(x = "Effect (posterior median and 95% CI; standardized / link scale)", y = NULL, color = NULL) +
+  theme_classic() +
+  theme(legend.position = "top", strip.background = element_blank(), strip.text = element_text(face = "bold"))
+
+dir.create("./output/figures", recursive = TRUE, showWarnings = FALSE)
+ggsave("./output/figures/v06_effects_summary.png", effects_gg, width = 8, height = 6, dpi = 300)
+
+effects_gg
+```
+
+
+<!-- '&nbsp;' adds blank space -->
+
+<!-- light green box -->
+
+::: {.alert .alert-success}
+# Takeaways {#takeaways .unnumbered .unlisted}
+
+Acoustic distance metric: **energy distance**, with social and acoustic blocks aligned by recording date
+
+- **Social behavior during a period and acoustic change** (Model 1, n = `r nrow(dat_m1)` dyad-periods): proximity `r support(c_m1_prox)`, agonistic `r support(c_m1_ago)`, affiliative `r support(c_m1_aff)` (LOO vs null: `r l_m1$verdict`).
+- **Social -> later acoustic change** (Model 2): proximity `r support(c_m2_ac_prox)`, agonistic `r support(c_m2_ac_ago)`, affiliative `r support(c_m2_ac_aff)`.
+- **Acoustic -> later social behavior** (Model 2): proximity `r support(c_m2_close)`, agonistic `r support(c_m2_ago)`, affiliative `r support(c_m2_aff)`.
+- **Robustness**: placebo `r if (!pl_flag) "passed" else "not clean"`; largest shift of a key effect under a wider prior `r sprintf("%.3f", max(abs(sens$shift)))`.
+- Results from `stats_v05_energy.qmd` and earlier versions paired acoustic data with social data from one block later, so they are not directly comparable with these.
+:::
+
+<!-- '---' adds a gray vertical line -->
+
+------------------------------------------------------------------------
+
+<!-- add packages used, system details and versions  -->
+
+::: {.callout-note collapse="true"}
+## Session information {.unnumbered .unlisted}
+
+```{r session info}
+#| echo: false
+
+# if devtools is installed use devtools::session_info()
+if (requireNamespace("devtools", quietly = TRUE)) {
+  devtools::session_info()
+} else {
+  sessionInfo()
+}
+
+```
+:::

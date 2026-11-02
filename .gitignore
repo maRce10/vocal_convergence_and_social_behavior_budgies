@@ -1,0 +1,35 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Only the website and the latest analysis are tracked: everything else
+# (data, earlier analysis versions, manuscript drafts) stays local.
+/*
+!/.gitignore
+!/.github/
+!/_quarto.yml
+!/index.qmd
+!/styles.css
+!/_figure-download.html
+!/README.md
+!/vocal_convergence_and_social_behavior_budgies.Rproj
+
+# cached code results used to build the website (execute: freeze: auto)
+!/_freeze/
+
+# figures shown on the website
+!/output/
+/output/*
+!/output/figures/
+
+# latest analysis only
+!/scripts/
+/scripts/*
+!/scripts/stats_v06_energy.qmd
+!/scripts/qmd.css
+
+# rendered website (built and deployed by .github/workflows/publish.yml)
+/_site/
+/.quarto/
+**/*.quarto_ipynb
